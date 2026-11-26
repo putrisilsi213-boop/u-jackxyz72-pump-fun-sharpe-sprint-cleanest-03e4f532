@@ -13,12 +13,12 @@ A Sharpe-optimised confirmed-runner paper bot for the
 Steady small wins, tiny drawdown. The bot buys only **confirmed runners**:
 a coin that has dipped 20–55% off its recent high, is trading at least 8%
 below its recent volume-weighted price, and has **already turned** — price
-bounced ≥15% off its recent low with buyers in 7 of the last 10 trades.
+bounced ≥13% off its recent low with buyers in 7 of the last 10 trades.
 Never snipes fresh launches, never averages down, one entry per dip.
 
-Exits are tight and fee-aware: 6% take-profit, 4% stop-loss, a trailing
-give-back once up 3%, or a 200-slot max hold — whichever comes first.
-Stakes are 0.15 SOL per position, max 5 open, max 1 new entry per batch.
+Exits are tight and fee-aware: 8% take-profit, 5% stop-loss, a trailing
+give-back of 5% once up 4%, or a 300-slot max hold — whichever comes first.
+Stakes are 0.25 SOL per position, max 5 open, max 1 new entry per batch.
 
 Everything is a pure function of the batches the harness sends: no clock,
 no randomness, no I/O, so the two graded executions produce byte-identical
