@@ -1,309 +1,240 @@
-// Sharpe-optimised confirmed-runner bot for the pump.fun replay (agent-fun/replay/v2).
+// Sharpe Runner — confirmed-runner paper trader for the pump.fun replay harness.
 //
-// Ranking is by HOURLY SHARPE, not raw PnL, so this bot optimises steady small
-// wins and a tiny drawdown instead of chasing the biggest move:
+// Buys only confirmed runners: a coin that has dipped off its recent high, trades
+// below its recent volume-weighted average price, and has already turned (bounced
+// off its recent low with buyers winning most of the last trades). Exits on
+// take-profit, stop-loss, a trailing give-back once in profit, or a max hold.
 //
-//   - Enter only CONFIRMED runners: a coin 20-55% off its recent high, trading
-//     at least 8% below the volume-weighted price of its own recent flow, that
-//     has ALREADY turned — price bounced >=13% off its recent low with buyers
-//     in 7 of the last 10 trades. Never snipe fresh launches, never buy a fall.
-//   - One entry per dip, one tranche, no averaging down.
-//   - Tight, fee-aware exits: 8% take-profit, 5% stop-loss, a trailing
-//     give-back once up 4%, or a 300-slot max hold — whichever comes first.
-//   - 0.25 SOL per position, max 5 open, max 1 new entry per batch: few, big
-//     enough that the fixed 105,000-lamport tx fee stays a small share.
-//
-// Everything is a pure function of the batches the harness sends: no clock, no
-// randomness, no I/O, no environment reads, so the two graded executions produce
-// byte-identical action logs.
-//
-// Tuning (dev window, grade-local): this parameter set scores hourly Sharpe
-// 0.409, net +0.298 SOL, max drawdown 0.60%, 56 fills over 26 coins, win rate
-// 42.9%. Its neighbours are all close (Sharpe 0.397-0.406, net +0.28-0.30 SOL,
-// drawdown 0.53-0.60%), so the result does not rest on one knife-edge point.
-// The looser Dip Buyer it descends from scored Sharpe 0.295 / +0.258 SOL / 1.52%
-// drawdown on the same window. Tighter exits (TP 5-6%) score WORSE on Sharpe:
-// wins shrink below the fee band while losses stay, so 8%/5% is the sweet spot.
+// Pure function of the batches: no clock, no randomness, no I/O, fully
+// deterministic — two graded runs produce byte-identical action logs.
+// Node 22 standard library only.
 
-import type { Batch, BotState, OrderInput, Pubkey } from './vendor/makefun-bot.ts';
+import type { Batch, BotState, OrderInput } from './vendor/makefun-bot.ts';
 
-export interface Params {
-  /** Trades kept per mint for the VWAP / flow read. */
-  windowTrades: number;
-  /** Slots back over which the recent high is taken. */
-  highWindowSlots: number;
-  /** Enter when price is at least this far below the recent high... */
-  dipMin: number;
-  /** ...and no further than this (a collapse, not a dip). */
-  dipMax: number;
-  /** Enter only when price is at least this far below the recent VWAP. */
-  vwapGapMin: number;
-  /** Trades used for the VWAP anchor (longer than the flow window, so it still
-      remembers pre-dip prices when the dip itself is only a few trades old). */
-  vwapTrades: number;
-  /** Trades used for the VWAP and the buyer-flow read. */
-  flowTrades: number;
-  /** Of the last `flowTrades` trades at least this many must be buys. */
-  minFlowBuys: number;
-  /** Net SOL bought over the last `flowTrades` trades must be >= this. */
-  minNetBuySol: bigint;
-  /** The curve must hold at least this much real SOL at decision time. */
-  minRealSol: bigint;
-  /** Target stake per position (lamports), before the per-reply size cap. */
-  stake: bigint;
-  /** Smallest buy worth sending (transaction fee is 105k lamports per order). */
-  minBuy: bigint;
-  /** Take profit: exit when liquidation value reaches cost * (1 + takeProfit). */
-  takeProfit: number;
-  /** Stop loss: exit when liquidation value falls to cost * (1 - stopLoss). */
-  stopLoss: number;
-  /** Once the position is up this far, exit if value gives back this share of the peak. */
-  trailArm: number;
-  trailGiveback: number;
-  /** Exit after holding this many slots regardless. */
-  maxHoldSlots: number;
-  /** After an exit, ignore the coin for this many slots. */
-  cooldownSlots: number;
-  /** Enter only once the price has bounced at least this far off its recent low
-      (buy the turn, not the fall: the low is the cheapest price in the lookback). */
-  bounceMin: number;
-  /** Slippage tolerance on buys and on sells (bps). */
-  buySlippageBps: number;
-  sellSlippageBps: number;
-  /** Most new entries per reply. */
-  maxEntriesPerBatch: number;
-}
+// ---- tuned parameters ----
+// The thresholds below are the specification; only the lookback windows move.
+const STAKE_LAMPORTS = 250_000_000n; // 0.25 SOL per position
+const MAX_POSITIONS = 5;
+const MAX_ENTRIES_PER_BATCH = 1;
+const TAKE_PROFIT = 0.08; // +8%
+const STOP_LOSS = 0.05; // -5%
+const TRAIL_ARM = 0.04; // trailing arms once up 4%
+const TRAIL_GIVEBACK = 0.05; // sell after a 5% give-back from the peak
+const MAX_HOLD_SLOTS = 300;
+const DIP_MIN = 0.2; // dipped at least 20% off the recent high
+const DIP_MAX = 0.55; // ... but no more than 55%
+const VWAP_DISCOUNT = 0.08; // at least 8% below recent VWAP
+const BOUNCE_MIN = 0.13; // bounced at least 13% off the recent low
+const BUY_WINDOW = 10; // buyers made 7 of the last 10 trades
+const BUY_MIN = 7;
+const HIGH_WINDOW = 50; // recent-high lookback, in trades
+const LOW_WINDOW = 50; // recent-low lookback, in trades
+const VWAP_WINDOW = 50; // VWAP lookback, in trades
+const MIN_TRADES = 20; // never buy a fresh launch
+const SLIPPAGE_BPS = 500;
 
-// Sharpe-tuned values (see header): confirmed-runner entry at a 13% bounce with
-// 7-of-10 buyer flow, 8% take-profit against a 5% stop, 300-slot max hold,
-// 0.25 SOL stakes. The guardrail bar (a round trip of at least 0.01 SOL on at
-// least 20 coins) is cleared with margin: 26 coins, 28 round trips on dev.
-export const DEFAULT_PARAMS: Params = {
-  windowTrades: 60,
-  highWindowSlots: 2500,
-  dipMin: 0.2,
-  dipMax: 0.55,
-  vwapGapMin: 0.08,
-  vwapTrades: 40,
-  flowTrades: 10,
-  minFlowBuys: 7,
-  minNetBuySol: 0n,
-  minRealSol: 2_000_000_000n,
-  stake: 250_000_000n,
-  minBuy: 15_000_000n,
-  takeProfit: 0.08,
-  stopLoss: 0.05,
-  trailArm: 0.04,
-  trailGiveback: 0.05,
-  maxHoldSlots: 300,
-  cooldownSlots: 240,
-  bounceMin: 0.13,
-  buySlippageBps: 500,
-  sellSlippageBps: 3000,
-  maxEntriesPerBatch: 1,
-};
-
-const FEE_BPS = 125n; // protocol 95 + creator 30 bps, charged on each side.
-const BPS = 10_000n;
+// ---- per-mint history (module state, fresh on every run) ----
 
 interface Tick {
+  price: number; // SOL per token, from post-trade virtual reserves
+  sol: number; // SOL side of the trade, in lamports
+  tokens: number; // token side of the trade, in base units
+  buy: boolean;
   slot: number;
-  price: number; // virtual SOL per virtual token (marginal price).
-  isBuy: boolean;
-  sol: bigint; // SOL side of the trade, for VWAP weighting.
-  realSol: bigint;
 }
 
 interface Coin {
   ticks: Tick[];
-  entryPrice: number;
-  entrySlot: number;
-  peakValue: bigint; // best liquidation value seen since entry.
-  coolUntil: number;
-  exiting: boolean; // a sell is in flight: do not send another.
+  createdSlot: number | null;
+  complete: boolean;
+  enteredDip: string | null; // high-slot key of the dip already entered, if any
 }
 
-/** What selling `tokens` would net now, curve fees deducted, tx fee not included. */
-function liquidationValue(
-  vq: bigint,
-  vt: bigint,
-  rq: bigint,
-  tokens: bigint,
-): bigint {
-  if (tokens <= 0n || vt <= 0n) return 0n;
-  let out = (tokens * vq) / (vt + tokens);
-  if (out > rq) out = rq;
-  return out - (out * FEE_BPS + BPS - 1n) / BPS;
+interface OpenTrade {
+  entryPrice: number; // SOL per token, from the position cost basis
+  entrySlot: number; // slot the position was first seen in the account
+  peak: number; // highest price seen since entry
 }
 
-export function createSharpeBot(p: Params = DEFAULT_PARAMS) {
-  const coins = new Map<Pubkey, Coin>();
-  const coin = (mint: Pubkey): Coin => {
-    let c = coins.get(mint);
-    if (c === undefined) {
-      c = { ticks: [], entryPrice: 0, entrySlot: -1, peakValue: 0n, coolUntil: -1, exiting: false };
-      coins.set(mint, c);
-    }
-    return c;
-  };
+const coins = new Map<string, Coin>();
+const openTrades = new Map<string, OpenTrade>();
+const MAX_TICKS = 512; // history cap per mint; windows above stay well inside it
 
-  return function onBatch(state: BotState, batch: Batch): OrderInput[] {
-    const slot = batch.slot;
-    const orders: OrderInput[] = [];
-    const orderCap = state.hello.caps.max_orders_per_batch;
-    const txFee = state.txFeeLamports();
-    const pendingMints = new Set<Pubkey>();
-    for (const o of state.pending.values()) pendingMints.add(o.order.mint);
-
-    // --- Record this batch's trades, in chain order. ---
-    const traded: Pubkey[] = [];
-    for (const e of batch.events) {
-      if (e.event !== 'TradeEvent') continue;
-      const c = coin(e.mint);
-      const vt = BigInt(e.virtual_token_reserves);
-      const vq = BigInt(e.virtual_quote_reserves);
-      const price = vt === 0n ? 0 : Number(vq) / Number(vt);
-      c.ticks.push({
-        slot: e.slot,
-        price,
-        isBuy: e.is_buy,
-        sol: BigInt(e.sol_amount),
-        realSol: BigInt(e.real_quote_reserves),
-      });
-      if (c.ticks.length > p.windowTrades) c.ticks.splice(0, c.ticks.length - p.windowTrades);
-      if (traded[traded.length - 1] !== e.mint && !traded.includes(e.mint)) traded.push(e.mint);
-    }
-
-    // --- A sell that resolved frees the coin; a buy that never filled forgets the entry. ---
-    for (const f of batch.fills) {
-      const c = coins.get(f.mint);
-      if (c === undefined) continue;
-      if (f.side === 'sell') {
-        c.exiting = false;
-        if (!state.positions.has(f.mint)) {
-          c.entrySlot = -1;
-          c.peakValue = 0n;
-          c.coolUntil = slot + p.cooldownSlots;
-        }
-      } else if (f.status !== 'filled' && !state.positions.has(f.mint)) {
-        let stillPending = false;
-        for (const o of state.pending.values()) if (o.order.mint === f.mint) stillPending = true;
-        if (!stillPending) {
-          c.entrySlot = -1;
-          c.peakValue = 0n;
-        }
-      }
-    }
-
-    // --- 1. Manage held positions: exits first, in sorted mint order. ---
-    // Exits decide the Sharpe: take small wins early, cut losers at -5% before
-    // they can dent the hourly series, and never let a position drift stale.
-    const held = [...state.positions.keys()].sort();
-    for (const mint of held) {
-      if (orders.length >= orderCap) break;
-      const h = state.positions.get(mint)!;
-      const c = coin(mint);
-      const curve = state.curves.get(mint);
-      if (curve === undefined || curve.complete || c.exiting || pendingMints.has(mint)) continue;
-      const value = liquidationValue(
-        curve.virtual_quote_reserves,
-        curve.virtual_token_reserves,
-        curve.real_quote_reserves,
-        h.token_amount,
-      );
-      if (value > c.peakValue) c.peakValue = value;
-      const cost = h.cost_lamports;
-      const gain = cost > 0n ? Number(value - cost) / Number(cost) : 0;
-      const peakGain = cost > 0n ? Number(c.peakValue - cost) / Number(cost) : 0;
-      const takeProfit = gain >= p.takeProfit;
-      const stopLoss = gain <= -p.stopLoss;
-      const trailing =
-        peakGain >= p.trailArm && value <= (c.peakValue * BigInt(Math.round((1 - p.trailGiveback) * 10000))) / 10000n;
-      const stale = c.entrySlot >= 0 && slot - c.entrySlot >= p.maxHoldSlots;
-      if (takeProfit || stopLoss || trailing || stale) {
-        orders.push({ side: 'sell', mint, token_amount: h.token_amount, max_slippage_bps: p.sellSlippageBps });
-        c.exiting = true;
-      }
-    }
-
-    // --- 2. New entries on coins that traded this batch. ---
-    // The entry bar is deliberately high: dip + VWAP gap + bounce + buyer flow
-    // + last trade a buy. Most batches produce no entry at all — that is the
-    // point. Every fill pays curve + tx fees, so a marginal trade is a Sharpe
-    // loss even when it wins a little.
-    let entries = 0;
-    for (const mint of traded) {
-      if (orders.length >= orderCap || entries >= p.maxEntriesPerBatch) break;
-      if (state.committedPositionCount() >= state.hello.caps.max_open_positions) break;
-      if (state.positions.has(mint) || pendingMints.has(mint)) continue;
-      const curve = state.curves.get(mint);
-      if (curve === undefined || curve.complete) continue;
-      const c = coin(mint);
-      if (slot < c.coolUntil) continue;
-      const ticks = c.ticks;
-      if (ticks.length < p.flowTrades) continue;
-      const last = ticks[ticks.length - 1]!;
-      if (last.realSol < p.minRealSol) continue;
-
-      // Recent high (and low) over the lookback window.
-      let high = 0;
-      let low = Number.POSITIVE_INFINITY;
-      for (let i = ticks.length - 1; i >= 0; i--) {
-        const t = ticks[i]!;
-        if (slot - t.slot > p.highWindowSlots) break;
-        if (t.price > high) high = t.price;
-        if (t.price < low) low = t.price;
-      }
-      if (high <= 0 || low === Number.POSITIVE_INFINITY) continue;
-      const dip = 1 - last.price / high;
-      if (dip < p.dipMin || dip > p.dipMax) continue;
-      // The turn must already be happening: price off the low.
-      if (last.price < low * (1 + p.bounceMin)) continue;
-
-      // Volume-weighted price of the recent flow, and who is buying it.
-      // The VWAP anchors on a longer window than the flow read, so it still
-      // remembers pre-dip prices when the dip itself is only a few trades old.
-      let wSum = 0;
-      let vSum = 0n;
-      const vFrom = Math.max(0, ticks.length - p.vwapTrades);
-      for (let i = vFrom; i < ticks.length; i++) {
-        const t = ticks[i]!;
-        wSum += t.price * Number(t.sol);
-        vSum += t.sol;
-      }
-      if (vSum === 0n) continue;
-      const vwap = wSum / Number(vSum);
-      if (vwap <= 0 || last.price > vwap * (1 - p.vwapGapMin)) continue;
-      let buys = 0;
-      let netBuy = 0n;
-      const from = Math.max(0, ticks.length - p.flowTrades);
-      for (let i = from; i < ticks.length; i++) {
-        const t = ticks[i]!;
-        if (t.isBuy) {
-          buys++;
-          netBuy += t.sol;
-        } else {
-          netBuy -= t.sol;
-        }
-      }
-      if (buys < p.minFlowBuys || netBuy < p.minNetBuySol) continue;
-      if (!last.isBuy) continue; // the dip is being bought, not still falling.
-
-      // Size: target stake, capped at 97% of the per-reply size cap (our own fills
-      // shift the reserves the harness checks against, so leave a margin).
-      const sizeCap = (state.maxBuyLamports(mint) * 97n) / 100n;
-      let amount = p.stake < sizeCap ? p.stake : sizeCap;
-      if (amount < p.minBuy) continue;
-      if (state.freeCashLamports() - amount - txFee < 0n) continue;
-
-      orders.push({ side: 'buy', mint, quote_lamports: amount, max_slippage_bps: p.buySlippageBps });
-      c.entryPrice = last.price;
-      c.entrySlot = slot;
-      c.peakValue = 0n;
-      c.exiting = false;
-      pendingMints.add(mint);
-      entries++;
-    }
-    return orders;
-  };
+function coinFor(mint: string): Coin {
+  let coin = coins.get(mint);
+  if (coin === undefined) {
+    coin = { ticks: [], createdSlot: null, complete: false, enteredDip: null };
+    coins.set(mint, coin);
+  }
+  return coin;
 }
+
+// ---- window helpers ----
+
+// Price of a curve from its virtual reserves: SOL per token.
+function curvePrice(virtualQuote: bigint, virtualToken: bigint): number {
+  if (virtualToken === 0n) return 0;
+  return Number(virtualQuote) / Number(virtualToken);
+}
+
+interface WindowStats {
+  high: number;
+  highSlot: number;
+  low: number;
+  vwap: number;
+}
+
+// Recent high / low / VWAP over the last `highN` / `lowN` / `vwapN` ticks.
+// VWAP is total SOL traded divided by total tokens traded in its window.
+function windowStats(ticks: Tick[], highN: number, lowN: number, vwapN: number): WindowStats {
+  let high = 0;
+  let highSlot = -1;
+  const highStart = Math.max(0, ticks.length - highN);
+  for (let i = highStart; i < ticks.length; i++) {
+    if (ticks[i].price > high) {
+      high = ticks[i].price;
+      highSlot = ticks[i].slot;
+    }
+  }
+  let low = Number.POSITIVE_INFINITY;
+  const lowStart = Math.max(0, ticks.length - lowN);
+  for (let i = lowStart; i < ticks.length; i++) {
+    if (ticks[i].price < low) low = ticks[i].price;
+  }
+  let solSum = 0;
+  let tokenSum = 0;
+  const vwapStart = Math.max(0, ticks.length - vwapN);
+  for (let i = vwapStart; i < ticks.length; i++) {
+    solSum += ticks[i].sol;
+    tokenSum += ticks[i].tokens;
+  }
+  return { high, highSlot, low, vwap: tokenSum > 0 ? solSum / tokenSum : 0 };
+}
+
+// How many of the last `BUY_WINDOW` trades were buys.
+function buyPressure(ticks: Tick[]): number {
+  let buys = 0;
+  const start = Math.max(0, ticks.length - BUY_WINDOW);
+  for (let i = start; i < ticks.length; i++) {
+    if (ticks[i].buy) buys++;
+  }
+  return buys;
+}
+
+// ---- entry ----
+
+function hasPendingBuy(state: BotState, mint: string): boolean {
+  for (const pending of state.pending.values()) {
+    if (pending.order.side === 'buy' && pending.order.mint === mint) return true;
+  }
+  return false;
+}
+
+// Fold this batch's events into history, testing each trade's mint for entry
+// right after its tick lands. Returns the batch's one buy order, if any.
+function ingestAndEnter(state: BotState, batch: Batch): OrderInput | undefined {
+  let buy: OrderInput | undefined;
+  const room = state.committedPositionCount() < MAX_POSITIONS;
+  for (const event of batch.events) {
+    if (event.event === 'CreateEvent') {
+      coinFor(event.mint).createdSlot = event.slot;
+      continue;
+    }
+    if (event.event === 'CompleteEvent') {
+      coinFor(event.mint).complete = true;
+      continue;
+    }
+    if (event.event !== 'TradeEvent') continue;
+    const coin = coinFor(event.mint);
+    const price = curvePrice(BigInt(event.virtual_quote_reserves), BigInt(event.virtual_token_reserves));
+    coin.ticks.push({
+      price,
+      sol: Number(BigInt(event.sol_amount)),
+      tokens: Number(BigInt(event.token_amount)),
+      buy: event.is_buy,
+      slot: event.slot,
+    });
+    if (coin.ticks.length > MAX_TICKS) coin.ticks.splice(0, coin.ticks.length - MAX_TICKS);
+    if (buy !== undefined) continue;
+    if (!room) continue;
+    if (coin.complete || coin.ticks.length < MIN_TRADES) continue;
+    if (state.positions.has(event.mint) || hasPendingBuy(state, event.mint)) continue;
+    if (price <= 0) continue;
+    const stats = windowStats(coin.ticks, HIGH_WINDOW, LOW_WINDOW, VWAP_WINDOW);
+    if (stats.high <= 0 || stats.vwap <= 0 || stats.low === Number.POSITIVE_INFINITY) continue;
+    const dip = (stats.high - price) / stats.high;
+    if (dip < DIP_MIN || dip > DIP_MAX) continue;
+    if (price > (1 - VWAP_DISCOUNT) * stats.vwap) continue;
+    if (price < (1 + BOUNCE_MIN) * stats.low) continue;
+    if (buyPressure(coin.ticks) < BUY_MIN) continue;
+    const dipKey = String(stats.highSlot);
+    if (coin.enteredDip === dipKey) continue; // at most one new entry per dip
+    const cap = state.maxBuyLamports(event.mint);
+    const size = cap > 0n && cap < STAKE_LAMPORTS ? cap : STAKE_LAMPORTS;
+    if (size <= 0n) continue;
+    if (state.freeCashLamports() < size + state.txFeeLamports()) continue;
+    coin.enteredDip = dipKey;
+    buy = { side: 'buy', mint: event.mint, quote_lamports: size, max_slippage_bps: SLIPPAGE_BPS };
+  }
+  return buy;
+}
+
+// ---- exits ----
+
+function hasPendingSell(state: BotState, mint: string): boolean {
+  for (const pending of state.pending.values()) {
+    if (pending.order.side === 'sell' && pending.order.mint === mint) return true;
+  }
+  return false;
+}
+
+// Take profit, stop loss, trailing give-back once in profit, or max hold —
+// whichever comes first. Sells the full position.
+function exits(state: BotState): OrderInput[] {
+  const orders: OrderInput[] = [];
+  for (const [mint, holding] of state.positions) {
+    if (hasPendingSell(state, mint)) continue;
+    const curve = state.curves.get(mint);
+    if (curve === undefined || curve.complete) continue;
+    const price = curvePrice(curve.virtual_quote_reserves, curve.virtual_token_reserves);
+    if (!(price > 0)) continue;
+    let trade = openTrades.get(mint);
+    if (trade === undefined) {
+      const tokens = Number(holding.token_amount);
+      const entryPrice = tokens > 0 ? Number(holding.cost_lamports) / tokens : 0;
+      if (!(entryPrice > 0)) continue;
+      trade = { entryPrice, entrySlot: state.slot, peak: price };
+      openTrades.set(mint, trade);
+    }
+    if (price > trade.peak) trade.peak = price;
+    const ret = price / trade.entryPrice - 1;
+    const held = state.slot - trade.entrySlot;
+    let sell = false;
+    if (ret >= TAKE_PROFIT) sell = true;
+    else if (ret <= -STOP_LOSS) sell = true;
+    else if (trade.peak >= (1 + TRAIL_ARM) * trade.entryPrice && price <= (1 - TRAIL_GIVEBACK) * trade.peak) sell = true;
+    else if (held >= MAX_HOLD_SLOTS) sell = true;
+    if (sell) {
+      orders.push({ side: 'sell', mint, token_amount: holding.token_amount, max_slippage_bps: SLIPPAGE_BPS });
+      openTrades.delete(mint);
+    }
+  }
+  for (const mint of [...openTrades.keys()]) {
+    if (!state.positions.has(mint)) openTrades.delete(mint);
+  }
+  return orders;
+}
+
+// ---- entry point for main.ts ----
+
+// One batch, one decision: at most one new entry, plus an exit per position
+// whose rule fired. Order of evaluation is the batch's own event order, so
+// the result is a pure function of the batches seen so far.
+export function decideOrders(state: BotState, batch: Batch): OrderInput[] {
+  const orders: OrderInput[] = [];
+  const buy = ingestAndEnter(state, batch);
+  if (buy !== undefined) orders.push(buy);
+  for (const sell of exits(state)) orders.push(sell);
+  return orders;
+}
+

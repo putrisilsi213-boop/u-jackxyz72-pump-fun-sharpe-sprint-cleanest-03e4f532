@@ -1,7 +1,13 @@
-// Sharpe-optimised confirmed-runner bot for make.fun's Pump.fun Sharpe Sprint.
-// Run by the grader as `node /bot/main.ts`; the SDK shim is vendored in vendor/.
+// Sharpe Runner — entry point.
+//
+// Wires the strategy into the pump.fun replay harness: the vendored shim owns
+// the wire (stdin/stdout, hello/batch/done), the strategy owns the decisions.
 
 import { runBot } from './vendor/makefun-bot.ts';
-import { createSharpeBot, DEFAULT_PARAMS } from './strategy.ts';
+import { decideOrders } from './strategy.ts';
 
-await runBot({ onBatch: createSharpeBot(DEFAULT_PARAMS) });
+await runBot({
+  onBatch(state, batch) {
+    return decideOrders(state, batch);
+  },
+});
